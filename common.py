@@ -97,8 +97,8 @@ def add_guassian_noise(params, noise_std, key):
     return params_with_noise, noise
 
 
-@partial(jax.jit, static_argnums=(0,1,2,6,7,8,9,10))
-def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_params, key, learning_rate=1e-3, episode_length=1000, action_repeat=1, normalize_observations=True, batch_size=1, clipping=1e9):
+@partial(jax.jit, static_argnums=(0,1,2,6,7,8,9,10,11,12))
+def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_params, key, learning_rate=1e-3, episode_length=1000, action_repeat=1, normalize_observations=True, batch_size=1, clipping=1e9, truncation_length=None):
 
     env = env_fn()
     optimizer = optax.adam(learning_rate=learning_rate)
@@ -110,15 +110,12 @@ def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_par
     clip_init, clip_update = optax.adaptive_grad_clip(clipping, eps=0.001)
     clip_state = clip_init(policy_params)
 
-
-    # @jax.jit
     def do_training_rollout(policy_params, normalizer_params, key):
         init_state = env.reset(key)
         h0 = jnp.zeros_like(init_state.obs)
 
-      #  @jax.jit
         def do_one_rnn_step(carry):
-            state, h, policy_params, normalizer_params, reward_sum  = carry
+            state, h, policy_params, normalizer_params, reward_sum, step_index  = carry
 
             normed_obs = obs_normalizer_apply_fn(normalizer_params, state.obs)
             h1 , actions = policy_apply(policy_params, h, normed_obs)
@@ -128,28 +125,30 @@ def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_par
             #h1 = jax.lax.cond(nstate.done, lambda x: jnp.zeros_like(h1), lambda x: h1, None)
             #jax.lax.stop_gradient(nstate)
 
+            if truncation_length is not None and truncation_length > 0:
+                nstate = jax.lax.cond(
+                    jnp.mod(step_index + 1, truncation_length) == 0.,
+                    jax.lax.stop_gradient, lambda x: x, nstate)
+
+
             reward_sum += nstate.reward
-            
-            return (jax.lax.stop_gradient(nstate), h1, policy_params, normalizer_params, reward_sum), None
+            step_index += 1
+            return (nstate, h1, policy_params, normalizer_params, reward_sum, step_index), None
             #return (nstate, h1, policy_params, normalizer_params, reward_sum), None
 
-            #return (nstate, h1, policy_params, normalizer_params), (nstate.reward,state.obs, actions, nstate)
-
-     #   @jax.jit
         def noop(carry):
             return carry, None
 
-     #   @jax.jit
         def body_fn(carry, x):
             done = jnp.any(carry[0].done)
             return jax.lax.cond(done, noop, do_one_rnn_step, carry)
         
         carry , _  = jax.lax.scan(
-            body_fn, (init_state, h0, policy_params, normalizer_params, 0.0),
+            body_fn, (init_state, h0, policy_params, normalizer_params, 0.0, 0),
             None,
             length=episode_length // action_repeat)
 
-        reward_sum = carry[-1]
+        reward_sum = carry[-2]
         
         return reward_sum    
     
@@ -161,7 +160,6 @@ def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_par
 
     vmap_rnn_rollout = jax.vmap(do_training_rollout, in_axes=(None, None, 0))
 
-    @jax.jit
     def sum_rnn_loss(policy_params, normalizer_params, key):
         keys = jax.random.split(key, num=batch_size)
         rewards_sums = vmap_rnn_rollout(policy_params, normalizer_params, keys)
@@ -169,7 +167,6 @@ def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_par
 
     grad_fn = jax.value_and_grad(sum_rnn_loss)
 
-    #@jax.jit
     def do_one_apg_iter(carry, epoch):
         optimizer_state, clip_state, key, policy_params, normalizer_params = carry
         key, reset_key = jax.random.split(key)
