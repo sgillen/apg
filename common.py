@@ -112,10 +112,10 @@ def add_guassian_noise(params, noise_std, key):
     
     params_with_noise = jax.tree_multimap(lambda g, n: g + n * noise_std,
                                       params, noise)
-    # anti_params_with_noise = jax.tree_multimap(
-    #     lambda g, n: g - n * perturbation_std, params, noise)
+    anti_params_with_noise = jax.tree_multimap(
+        lambda g, n: g - n * noise_std, params, noise)
     
-    return params_with_noise, noise
+    return params_with_noise, anti_params_with_noise, noise
 
 
 
