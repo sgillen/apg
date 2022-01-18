@@ -12,7 +12,6 @@ import matplotlib.pyplot as plt
 
 from controllers import GruController, MlpController, LinearController
 
-
 ## Common
 
 
@@ -234,10 +233,15 @@ def cem_apg(env_fn,
 
     env = env_fn()
 
+    jax.config.update('jax_platform_name', 'cpu')
+
+
     if policy is None:
         # Select policy size that is the closest power of 2 larger than 4x the observation size
         policy_size = int(2**jnp.ceil(jnp.log2(env.observation_size*4)))
         policy = GruController(env.observation_size, env.action_size, policy_size)
+
+    print("1")
 
     metrics = {}
     num_directions = jax.local_device_count()
@@ -249,9 +253,12 @@ def cem_apg(env_fn,
         env.observation_size, normalize_observations, num_leading_batch_dims=1)
 
     add_noise_pmap = jax.pmap(add_guassian_noise_mixed_std, in_axes=(None,None,0))
+    print("2")
     do_apg_pmap = jax.pmap(do_local_apg, in_axes = (None,None,None,None,0,0,None,None,None,None,None,None), static_broadcasted_argnums=(0,1,2,6,7,8,9,10,11,12))
+    print("3")
     do_rollout_pmap = jax.pmap(do_one_rollout, in_axes = (None,None,None,0,0,None,None,None), static_broadcasted_argnums=(0,1,5,6,7))
-
+    print("4")
+    
     init_states = jax.pmap(env.reset)(reset_keys)
     x0 = init_states.obs
     h0 = jnp.zeros(env.observation_size)
@@ -275,10 +282,12 @@ def cem_apg(env_fn,
 
         policy_params_with_noise, noise = add_noise_pmap(policy_params, noise_std, noise_keys)
         rewards_before, obs, acts, states_before = do_rollout_pmap(env_fn, policy.apply, normalizer_params, policy_params_with_noise, train_keys, episode_length, action_repeat, normalize_observations)
+        print("5")
 
         normalizer_params = obs_normalizer_update_fn(normalizer_params, obs[0,:])
 
         policy_params_with_noise, rewards_lists = do_apg_pmap(apg_epochs, env_fn, policy.apply, normalizer_params, policy_params_with_noise, train_keys, learning_rate, episode_length, action_repeat, normalize_observations, batch_size, clipping, truncation_length)
+        print("6")
         rewards_lists = jnp.nan_to_num(rewards_lists, nan=-10_000)
         reward_sums = [jnp.mean(rew[-5:]) for rew in rewards_lists]
         top_idx = sorted(range(len(reward_sums)), key=lambda k: reward_sums[k], reverse=True)
@@ -360,7 +369,7 @@ def cem_apg(env_fn,
             plt.plot(cem_rewards)
             plt.show()
 
-    return None, policy_params, best_rewards_list
+    return None, policy_params, best_reward_list
 
 
 
