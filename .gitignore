@@ -131,3 +131,5 @@ slurm-*.out
 *~
 
 **/tmp
+
+**/*save*

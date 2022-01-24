@@ -101,7 +101,8 @@ def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_par
     @jax.jit
     def do_one_apg_iter(carry, epoch):
         optimizer_state, clip_state, key, policy_params = carry
-        #key, reset_key = jax.random.split(key)
+
+        #key, reset_key = jax.random.split(key) # using the same key for each APG run works well, even when evaluating on many keys afterwards
         reset_key = key
         init_state = env.reset(reset_key)
 
@@ -124,31 +125,130 @@ def make_inference_fn(observation_size, action_size, normalize_observations, pol
     _, obs_normalizer_apply_fn = normalization.make_data_and_apply_fn(
     observation_size, normalize_observations)
 
-    def inference_fn(params, obs, key):
+    def inference_fn(params, h0, obs):
         normalizer_params, policy_params = params
         obs = obs_normalizer_apply_fn(normalizer_params, obs)
-        action = policy.apply(policy_params, obs)
-        return action
+        h1, action = policy.apply(policy_params, h0, obs)
+        return h1, action
 
     return inference_fn
 
 
-def cem_apg(env_fn,
-            total_epochs,
+def cem(env_fn,
+        epochs,
+        episode_length=500,
+        action_repeat=1,
+        key = jax.random.PRNGKey(0),
+        normalize_observations=True,
+        initial_std = 0.01,
+        num_elite = 8,
+        eps = 0.0,
+        policy = None,
+        print_freq=10
+        ):
+
+
+    env = env_fn()
+
+    if policy is None:
+        # Select policy size that is the closest power of 2 larger than 4x the observation size
+        policy_size = int(2**jnp.ceil(jnp.log2(env.observation_size*4)))
+        policy = GruController(env.observation_size, env.action_size, policy_size)
+
+    num_directions = jax.local_device_count()
+    reset_keys = jax.random.split(key, num=num_directions)
+    noise_keys = jax.random.split(reset_keys[0], num=num_directions)
+    _, model_key = jax.random.split(noise_keys[0])
+
+    normalizer_params, obs_normalizer_update_fn, obs_normalizer_apply_fn = normalization.create_observation_normalizer(
+        env.observation_size, normalize_observations, num_leading_batch_dims=1)
+
+    add_noise_pmap = jax.pmap(add_guassian_noise_mixed_std, in_axes=(None,None,0))
+    do_rollout_pmap = jax.pmap(do_one_rollout, in_axes = (None,None,None,0,0,None,None,None), static_broadcasted_argnums=(0,1,5,6,7))
+    
+    init_states = jax.pmap(env.reset)(reset_keys)
+    x0 = init_states.obs
+    h0 = jnp.zeros(env.observation_size)
+    
+    policy_params = policy.init(model_key, h0, x0)
+
+    policy_params_flat, policy_params_def = jax.tree_flatten(policy_params)
+    noise_std = jax.tree_unflatten(policy_params_def, [jnp.ones_like(p)*initial_std for p in policy_params_flat])
+    best_reward_list = []
+    
+    for i in range(epochs):
+        noise_keys = jax.random.split(noise_keys[0], num=num_directions)
+        train_keys = jax.random.split(noise_keys[0], num=num_directions)
+
+        
+        policy_params_with_noise, noise = add_noise_pmap(policy_params, noise_std, noise_keys)
+        rewards, obs, acts, states_before = do_rollout_pmap(env_fn, policy.apply, normalizer_params, policy_params_with_noise, train_keys, episode_length, action_repeat, normalize_observations)
+        reward_sums = jnp.sum(rewards, axis=1)
+        #cem_rewards.append(reward_sums[top_idx[0]])
+
+        top_idx = sorted(range(len(reward_sums)), key=lambda k: reward_sums[k], reverse=True)
+        params_with_noise_flat, params_with_noise_def = jax.tree_flatten(policy_params_with_noise)
+        params_elite_flat = [p[top_idx[:num_elite], :] for p in params_with_noise_flat]
+
+        if any([jnp.any(jnp.isnan(p)) for p in params_elite_flat]):
+            raise Exception("NaNs detected in elite params")
+
+        weights = jnp.array([1/num_elite for _ in range(num_elite)])
+
+        #weights = jnp.array([(jnp.log(1 + num_elite)/(k+1)) for k in range(num_elite)])
+        #weights = weights/jnp.sum(weights)
+
+        new_mean_flat = []
+        for elite_params in params_elite_flat:
+            weights = weights.reshape((num_elite, *[1 for _ in range(len(elite_params.shape)-1)]))
+            new_mean_flat.append(jnp.sum(weights*elite_params, axis=0))
+
+        new_var_flat = []
+        for old_params, elite_params in zip(policy_params_flat, params_elite_flat):
+            new_var = (old_params - elite_params)**2 + eps
+            weights = weights.reshape((num_elite, *[1 for _ in range(len(new_var.shape)-1)]))
+            new_var_flat.append(jnp.sqrt(jnp.sum(weights*new_var,axis=0)))
+
+        noise_keys = jax.random.split(noise_keys[0], num=num_directions)
+        noise_std = jax.tree_unflatten(policy_params_def, new_var_flat)
+        policy_params = jax.tree_unflatten(policy_params_def, new_mean_flat)   
+        policy_params_flat, policy_params_def = jax.tree_flatten(policy_params)
+        rewards_after_cem, obs, _, states_after_cem = do_one_rollout(env_fn, policy.apply, normalizer_params, policy_params, noise_keys[0], episode_length, action_repeat, normalize_observations)
+
+        done_idx = jnp.where(states_after_cem.done, size=1)[0].item()
+        if done_idx == 0:
+            done_idx = rewards_after_cem.shape[-1]
+
+        reward_sum_after_cem = jnp.sum(rewards_after_cem[:done_idx])
+
+        best_reward_list.append(reward_sum_after_cem)
+
+        # TODO this should be a passed in progress fn
+        if i % print_freq == 0:
+            clear_output(wait=True)
+            #plt.ylim([min_y, max_y])
+            plt.ylabel('reward per episode')
+            plt.plot(best_reward_list)
+            plt.show()
+
+
+    inference_fn = make_inference_fn(env.observation_size, env.action_size, normalize_observations, policy)
+    params = normalizer_params, policy_params
+    return inference_fn, params, best_reward_list
+
+
+
+def apg(env_fn,
+            apg_epochs,
             episode_length = 500,
             action_repeat = 1,
-            apg_epochs = 75,
-            cem_epochs = 5,
             batch_size = 1,
             key = jax.random.PRNGKey(0),
             normalize_observations=True,
             truncation_length = None,
             learning_rate = 5e-4,
             clipping = 1e9,
-            initial_std = 0.01,
-            num_elite = 8,
             eps = 0.0,
-            progress_fn = None,
             policy = None,
             print_freq = 1,
             ):
@@ -160,7 +260,6 @@ def cem_apg(env_fn,
         policy_size = int(2**jnp.ceil(jnp.log2(env.observation_size*4)))
         policy = GruController(env.observation_size, env.action_size, policy_size)
 
-    metrics = {}
     num_directions = jax.local_device_count()
     reset_keys = jax.random.split(key, num=num_directions)
     noise_keys = jax.random.split(reset_keys[0], num=num_directions)
@@ -179,8 +278,79 @@ def cem_apg(env_fn,
     
     policy_params = policy.init(model_key, h0, x0)
 
-    best_reward = -float('inf')
-    meta_rewards_list = []
+    policy_params_flat, policy_params_def = jax.tree_flatten(policy_params)
+    noise_std = jax.tree_unflatten(policy_params_def, [jnp.ones_like(p)*initial_std for p in policy_params_flat])
+    best_reward_list = []
+
+    # tau = (total_epochs-i)/total_epochs
+    # eps = tau*eps + (1 - tau)*eps_end
+
+    noise_keys = jax.random.split(noise_keys[0], num=num_directions)
+    train_keys = jax.random.split(noise_keys[0], num=num_directions)
+
+    rewards_before_noise , obs, _, states_after_cem = do_one_rollout(env_fn, policy.apply, normalizer_params, policy_params, train_keys[0], episode_length, action_repeat, normalize_observations)
+    normalizer_params = obs_normalizer_update_fn(normalizer_params, obs)
+
+    policy_params_with_noise, noise = add_noise_pmap(policy_params, noise_std, noise_keys)
+    rewards_before_apg, obs, _, states_before_apg = do_rollout_pmap(env_fn, policy.apply, normalizer_params, policy_params_with_noise, train_keys, episode_length, action_repeat, normalize_observations)
+
+    policy_params_with_noise, rewards_lists = do_apg_pmap(apg_epochs, env_fn, policy.apply, normalizer_params, policy_params_with_noise, train_keys, learning_rate, episode_length, action_repeat, normalize_observations, batch_size, clipping, truncation_length)
+
+    reward_sums = [jnp.mean(rew[-5:]) for rew in rewards_lists]
+    top_idx = sorted(range(len(reward_sums)), key=lambda k: reward_sums[k], reverse=True)
+
+    best_reward_list.append(reward_sums[top_idx[0]])    
+
+    inference_fn = make_inference_fn(env.observation_size, env.action_size, normalize_observations, policy)
+    params = normalizer_params, policy_params
+    return inference_fn, params, best_reward_list
+
+
+
+
+
+def cem_apg(env_fn,
+            total_epochs,
+            episode_length = 500,
+            action_repeat = 1,
+            apg_epochs = 75,
+            batch_size = 1,
+            key = jax.random.PRNGKey(0),
+            normalize_observations=True,
+            truncation_length = None,
+            learning_rate = 5e-4,
+            clipping = 1e9,
+            initial_std = 0.01,
+            num_elite = 8,
+            eps = 0.0,
+            policy = None,
+            print_freq = 1,
+            ):
+
+    env = env_fn()
+
+    if policy is None:
+        # Select policy size that is the closest power of 2 larger than 4x the observation size
+        policy_size = int(2**jnp.ceil(jnp.log2(env.observation_size*4)))
+        policy = GruController(env.observation_size, env.action_size, policy_size)
+
+    num_directions = jax.local_device_count()
+    reset_keys = jax.random.split(key, num=num_directions)
+    noise_keys = jax.random.split(reset_keys[0], num=num_directions)
+    _, model_key = jax.random.split(noise_keys[0])
+
+    normalizer_params, obs_normalizer_update_fn, obs_normalizer_apply_fn = normalization.create_observation_normalizer(
+        env.observation_size, normalize_observations, num_leading_batch_dims=1)
+
+    add_noise_pmap = jax.pmap(add_guassian_noise_mixed_std, in_axes=(None,None,0))
+    do_apg_pmap = jax.pmap(do_local_apg, in_axes = (None,None,None,None,0,0,None,None,None,None,None,None), static_broadcasted_argnums=(0,1,2,6,7,8,9,10,11,12))
+    do_rollout_pmap = jax.pmap(do_one_rollout, in_axes = (None,None,None,0,0,None,None,None), static_broadcasted_argnums=(0,1,5,6,7))
+    
+    init_states = jax.pmap(env.reset)(reset_keys)
+    x0 = init_states.obs
+    h0 = jnp.zeros(env.observation_size)
+    
+    policy_params = policy.init(model_key, h0, x0)
 
     policy_params_flat, policy_params_def = jax.tree_flatten(policy_params)
     noise_std = jax.tree_unflatten(policy_params_def, [jnp.ones_like(p)*initial_std for p in policy_params_flat])
@@ -193,9 +363,13 @@ def cem_apg(env_fn,
         noise_keys = jax.random.split(noise_keys[0], num=num_directions)
         train_keys = jax.random.split(noise_keys[0], num=num_directions)
 
+        rewards_before_noise , obs, _, states_after_cem = do_one_rollout(env_fn, policy.apply, normalizer_params, policy_params, train_keys[0], episode_length, action_repeat, normalize_observations)
+        normalizer_params = obs_normalizer_update_fn(normalizer_params, obs)
+        
         policy_params_with_noise, noise = add_noise_pmap(policy_params, noise_std, noise_keys)
-        rewards_before_apg, _, _, states_before_apg = do_rollout_pmap(env_fn, policy.apply, normalizer_params, policy_params_with_noise, train_keys, episode_length, action_repeat, normalize_observations)
+        rewards_before_apg, obs, _, states_before_apg = do_rollout_pmap(env_fn, policy.apply, normalizer_params, policy_params_with_noise, train_keys, episode_length, action_repeat, normalize_observations)
 
+        
         policy_params_with_noise, rewards_lists = do_apg_pmap(apg_epochs, env_fn, policy.apply, normalizer_params, policy_params_with_noise, train_keys, learning_rate, episode_length, action_repeat, normalize_observations, batch_size, clipping, truncation_length)
 
         reward_sums = [jnp.mean(rew[-5:]) for rew in rewards_lists]
@@ -203,54 +377,44 @@ def cem_apg(env_fn,
 
         best_reward_list.append(reward_sums[top_idx[0]])    
 
-        cem_rewards = [reward_sums[top_idx[0]]]
-        for j in range(cem_epochs):
-            top_idx = sorted(range(len(reward_sums)), key=lambda k: reward_sums[k], reverse=True)
-            params_with_noise_flat, params_with_noise_def = jax.tree_flatten(policy_params_with_noise)
-            params_elite_flat = [p[top_idx[:num_elite], :] for p in params_with_noise_flat]
+        reward_sum_before_cem = reward_sums[top_idx[0]]
 
-            if any([jnp.any(jnp.isnan(p)) for p in params_elite_flat]):
-                raise Exception("NaNs detected in elite params")
+        top_idx = sorted(range(len(reward_sums)), key=lambda k: reward_sums[k], reverse=True)
+        params_with_noise_flat, params_with_noise_def = jax.tree_flatten(policy_params_with_noise)
+        params_elite_flat = [p[top_idx[:num_elite], :] for p in params_with_noise_flat]
 
-            weights = jnp.array([1/num_elite for _ in range(num_elite)])
+        if any([jnp.any(jnp.isnan(p)) for p in params_elite_flat]):
+            raise Exception("NaNs detected in elite params")
 
-            #weights = jnp.array([(jnp.log(1 + num_elite)/(k+1)) for k in range(num_elite)])
-            #weights = weights/jnp.sum(weights)
+        weights = jnp.array([1/num_elite for _ in range(num_elite)])
+        
+        #weights = jnp.array([(jnp.log(1 + num_elite)/(k+1)) for k in range(num_elite)])
+        #weights = weights/jnp.sum(weights)
 
-            new_mean_flat = []
-            for elite_params in params_elite_flat:
-                weights = weights.reshape((num_elite, *[1 for _ in range(len(elite_params.shape)-1)]))
-                new_mean_flat.append(jnp.sum(weights*elite_params, axis=0))
+        new_mean_flat = []
+        for elite_params in params_elite_flat:
+            weights = weights.reshape((num_elite, *[1 for _ in range(len(elite_params.shape)-1)]))
+            new_mean_flat.append(jnp.sum(weights*elite_params, axis=0))
 
-            new_var_flat = []
-            for old_params, elite_params in zip(policy_params_flat, params_elite_flat):
-                new_var = (old_params - elite_params)**2 + eps
-                weights = weights.reshape((num_elite, *[1 for _ in range(len(new_var.shape)-1)]))
-                new_var_flat.append(jnp.sqrt(jnp.sum(weights*new_var,axis=0)))
+        new_var_flat = []
+        for old_params, elite_params in zip(policy_params_flat, params_elite_flat):
+            new_var = (old_params - elite_params)**2 + eps
+            weights = weights.reshape((num_elite, *[1 for _ in range(len(new_var.shape)-1)]))
+            new_var_flat.append(jnp.sqrt(jnp.sum(weights*new_var,axis=0)))
 
-            noise_keys = jax.random.split(noise_keys[0], num=num_directions)
-            noise_std = jax.tree_unflatten(policy_params_def, new_var_flat)
-            policy_params = jax.tree_unflatten(policy_params_def, new_mean_flat)   
-            policy_params_flat, policy_params_def = jax.tree_flatten(policy_params)
-            rewards_after_cem, obs, _, states_after_cem = do_one_rollout(env_fn, policy.apply, normalizer_params, policy_params, train_keys[0], episode_length, action_repeat, normalize_observations)
+        noise_keys = jax.random.split(noise_keys[0], num=num_directions)
+        noise_std = jax.tree_unflatten(policy_params_def, new_var_flat)
+        policy_params = jax.tree_unflatten(policy_params_def, new_mean_flat)   
+        policy_params_flat, policy_params_def = jax.tree_flatten(policy_params)
+        rewards_after_cem, obs, _, states_after_cem = do_one_rollout(env_fn, policy.apply, normalizer_params, policy_params, train_keys[0], episode_length, action_repeat, normalize_observations)
 
-            done_idx = jnp.where(states_after_cem.done, size=1)[0].item()
-            if done_idx == 0:
-                done_idx = rewards_after_cem.shape[-1]
-            cem_rewards.append(jnp.sum(rewards_after_cem[:done_idx]))
+        done_idx = jnp.where(states_after_cem.done, size=1)[0].item()
+        if done_idx == 0:
+            done_idx = rewards_after_cem.shape[-1]
 
-            normalizer_params = obs_normalizer_update_fn(normalizer_params, obs)
+        reward_sum_after_cem = jnp.sum(rewards_after_cem[:done_idx])
 
-            # If only doing one iteration of CEM these won't be used
-            policy_params_with_noise, noise = add_noise_pmap(policy_params, noise_std, noise_keys)
-            rewards_before_cem, obs, acts, states_before_cem = do_rollout_pmap(env_fn, policy.apply, normalizer_params, policy_params_with_noise, train_keys, episode_length, action_repeat, normalize_observations)
-            
-            done_idx = jnp.where(states_before_cem.done, size=1)[0].item()
-            if done_idx == 0:
-                done_idx = rewards_before_cem.shape[-1]
-                
-            reward_sums = jnp.sum(rewards_before_cem[:, :done_idx], axis=1)
-
+        # TODO this should be a passed in progress fn
         if i % print_freq == 0:
             clear_output(wait=True)
             #plt.ylim([min_y, max_y])
@@ -274,11 +438,9 @@ def cem_apg(env_fn,
                 if j == num_elite-1:
                     print("---")
             print("-------------------------------------------------")
+            print(f"cem: {reward_sum_before_cem} -> {reward_sum_after_cem}")
             print()
 
-            plt.figure()
-            plt.plot(cem_rewards)
-            plt.show()
 
     inference_fn = make_inference_fn(env.observation_size, env.action_size, normalize_observations, policy)
     params = normalizer_params, policy_params
