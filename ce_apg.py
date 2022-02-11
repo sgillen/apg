@@ -25,14 +25,23 @@ def add_guassian_noise_mixed_std(params, noise_std, key):
     )
     
     params_with_noise = jax.tree_multimap(lambda g, n: g + n,
-                                      params, noise)
-    # anti_params_with_noise = jax.tree_multimap(
-    #     lambda g, n: g - n * perturbation_std, params, noise)
-    
+                                      params, noise)    
     return params_with_noise, noise
 
+def make_inference_fn(observation_size, action_size, normalize_observations, policy):
 
-#@partial(jax.jit, static_argnums=(0,1,2,6,7,8,9,10,11,12))
+    _, obs_normalizer_apply_fn = normalization.make_data_and_apply_fn(
+    observation_size, normalize_observations)
+
+    def inference_fn(params, h0, obs):
+        normalizer_params, policy_params = params
+        obs = obs_normalizer_apply_fn(normalizer_params, obs)
+        h1, action = policy.apply(policy_params, h0, obs)
+        return h1, action
+
+    return inference_fn
+
+# an implementation of the Analytic Policy Gradient algorithm, it is meant to be run with ce_apg below, but you can call it by itself too. 
 def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_params, key, learning_rate=1e-3, episode_length=1000, action_repeat=1, normalize_observations=True, batch_size=1, clipping=1e9, truncation_length=None):
 
     env = env_fn()
@@ -44,7 +53,7 @@ def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_par
 
     clip_init, clip_update = optax.adaptive_grad_clip(clipping, eps=0.001)
     clip_state = clip_init(policy_params)
-
+    
     @jax.jit
     def do_training_rollout(policy_params, key):
         init_state = env.reset(key)
@@ -70,7 +79,6 @@ def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_par
 
             step_index += 1
             return (nstate, h1, reward_sum, step_index), None
-            #return (nstate, h1, policy_params, normalizer_params, reward_sum), None
 
         def noop(carry):
             return carry, None
@@ -102,7 +110,7 @@ def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_par
     def do_one_apg_iter(carry, epoch):
         optimizer_state, clip_state, key, policy_params = carry
 
-        key, reset_key = jax.random.split(key) # using the same key for each APG run works well, even when evaluating on many keys afterwards
+        key, reset_key = jax.random.split(key)
         reset_key = key
         init_state = env.reset(reset_key)
 
@@ -111,27 +119,11 @@ def do_local_apg(num_epochs, env_fn, policy_apply, normalizer_params, policy_par
         param_updates, clip_state = clip_update(param_updates, clip_state, policy_params)
         policy_params = optax.apply_updates(policy_params, param_updates)
 
-        #normalizer_params = obs_normalizer_update_fn(normalizer_params, obs)
-
         return (optimizer_state, clip_state, key, policy_params), -rewards
     
     (optimizer_state, clip_state, key, policy_params2), rewards = jax.lax.scan(do_one_apg_iter, (optimizer_state, clip_state, key, policy_params), (jnp.array(range(num_epochs))))
 
     return policy_params2, rewards
-
-
-def make_inference_fn(observation_size, action_size, normalize_observations, policy):
-
-    _, obs_normalizer_apply_fn = normalization.make_data_and_apply_fn(
-    observation_size, normalize_observations)
-
-    def inference_fn(params, h0, obs):
-        normalizer_params, policy_params = params
-        obs = obs_normalizer_apply_fn(normalizer_params, obs)
-        h1, action = policy.apply(policy_params, h0, obs)
-        return h1, action
-
-    return inference_fn
 
 
 def cem_apg(env_fn,
@@ -200,7 +192,7 @@ def cem_apg(env_fn,
         if learning_schedule is not None:
             learning_rate = jnp.power(10, (learning_schedule[0]*(total_epochs-i) + learning_schedule[1]*i)/total_epochs).item()
             print("learning rate: ", learning_rate)
-            
+
         # tau = (total_epochs-i)/total_epochs
         # eps = tau*eps + (1 - tau)*eps_end
 
@@ -297,7 +289,9 @@ def cem_apg(env_fn,
     return inference_fn, params, best_reward_list
 
 
+### =============================================================================================================
 
+## CEM by itself, doesn't work that well, is just here to do ablation studies.
 def cem(env_fn,
         epochs,
         episode_length=500,
@@ -401,6 +395,7 @@ def cem(env_fn,
     return inference_fn, params, best_reward_list
 
 
+## Parallel APG, basically just run APG N times in parallel, and then return the best result. Again only here for ablation studies. 
 def papg(env_fn,
             apg_epochs,
             episode_length = 500,
