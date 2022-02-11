@@ -134,11 +134,12 @@ def make_inference_fn(observation_size, action_size, normalize_observations, pol
     return inference_fn
 
 
-def apg(env_fn,
+def papg(env_fn,
             apg_epochs,
             episode_length = 500,
             action_repeat = 1,
             batch_size = 1,
+            initial_std = 0.01,
             key = jax.random.PRNGKey(0),
             normalize_observations=True,
             truncation_length = None,
@@ -203,32 +204,32 @@ def apg(env_fn,
 
 
 
-@partial(jax.jit, static_argnums=(0,1,5,6,7))
-def do_one_rollout(env_fn, policy_apply, normalizer_params, policy_params, key, episode_length=1000, action_repeat=1, normalize_observations=True):
+# @partial(jax.jit, static_argnums=(0,1,5,6,7))
+# def do_one_rollout(env_fn, policy_apply, normalizer_params, policy_params, key, episode_length=1000, action_repeat=1, normalize_observations=True):
 
-    env = env_fn()
-    _, obs_normalizer_update_fn, obs_normalizer_apply_fn = normalization.create_observation_normalizer(
-          env.observation_size, normalize_observations, num_leading_batch_dims=1)
+#     env = env_fn()
+#     _, obs_normalizer_update_fn, obs_normalizer_apply_fn = normalization.create_observation_normalizer(
+#           env.observation_size, normalize_observations, num_leading_batch_dims=1)
 
-    init_state = env.reset(key)
-    h0 = jnp.zeros_like(init_state.obs)
+#     init_state = env.reset(key)
+#     h0 = jnp.zeros_like(init_state.obs)
 
-    @jax.jit
-    def do_one_rnn_step(carry, step_idx):
-        state, h  = carry
+#     @jax.jit
+#     def do_one_rnn_step(carry, step_idx):
+#         state, h  = carry
         
-        normed_obs = obs_normalizer_apply_fn(normalizer_params, state.obs)
-        h1 , actions = policy_apply(policy_params, h, normed_obs)
-        nstate = env.step(state, actions)    
-        #h1 = jax.lax.cond(nstate.done, lambda x: jnp.zeros_like(h1), lambda x: h1, None)
-        #jax.lax.stop_gradient(nstate)
-        return (jax.lax.stop_gradient(nstate), h1), (nstate.reward,state.obs, actions, jax.lax.stop_gradient(nstate))
-        #return (nstate, h1, policy_params, normalizer_params), (nstate.reward,state.obs, actions, nstate)
+#         normed_obs = obs_normalizer_apply_fn(normalizer_params, state.obs)
+#         h1 , actions = policy_apply(policy_params, h, normed_obs)
+#         nstate = env.step(state, actions)    
+#         #h1 = jax.lax.cond(nstate.done, lambda x: jnp.zeros_like(h1), lambda x: h1, None)
+#         #jax.lax.stop_gradient(nstate)
+#         return (jax.lax.stop_gradient(nstate), h1), (nstate.reward,state.obs, actions, jax.lax.stop_gradient(nstate))
+#         #return (nstate, h1, policy_params, normalizer_params), (nstate.reward,state.obs, actions, nstate)
 
 
-    _, (rewards, obs, acts, states) = jax.lax.scan(
-        do_one_rnn_step, (init_state, h0),
-        (jnp.array(range(episode_length // action_repeat))),
-        length=episode_length // action_repeat)
+#     _, (rewards, obs, acts, states) = jax.lax.scan(
+#         do_one_rnn_step, (init_state, h0),
+#         (jnp.array(range(episode_length // action_repeat))),
+#         length=episode_length // action_repeat)
         
-    return rewards, obs, acts, states
+#     return rewards, obs, acts, states

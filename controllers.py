@@ -40,5 +40,5 @@ class LinearController(nn.Module):
     
     @nn.compact
     def __call__(self, carry, x):
-        a = jnp.tanh(nn.Dense(self.act_size, use_bias=use_bias)(x))
+        a = jnp.tanh(nn.Dense(self.act_size, use_bias=self.use_bias)(x))
         return carry, a
