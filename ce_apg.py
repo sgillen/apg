@@ -162,7 +162,6 @@ def cem_apg(env_fn,
         policy = GruController(env.observation_size, env.action_size, policy_size)
 
 
-
     num_directions = jax.local_device_count()
     reset_keys = jax.random.split(key, num=num_directions)
     noise_keys = jax.random.split(reset_keys[0], num=num_directions)
@@ -400,12 +399,6 @@ def cem(env_fn,
     inference_fn = make_inference_fn(env.observation_size, env.action_size, normalize_observations, policy)
     params = normalizer_params, policy_params
     return inference_fn, params, best_reward_list
-
-
-
-
-
-
 
 
 def papg(env_fn,
