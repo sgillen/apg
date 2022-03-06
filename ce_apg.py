@@ -258,13 +258,13 @@ def cem_apg(env_fn,
             for var in new_var_flat:
                 var_list.append(var.mean())
 
-            print(jnp.mean(jnp.array(var_list)))
-            #plt.ylim([min_y, max_y])
-            plt.ylabel('reward per episode')
-            plt.plot(best_reward_list)
-            plt.figure()
-            plt.plot(rewards_lists[top_idx[0]])
-            plt.show()
+            # print(jnp.mean(jnp.array(var_list)))
+            # #plt.ylim([min_y, max_y])
+            # plt.ylabel('reward per episode')
+            # plt.plot(best_reward_list)
+            # plt.figure()
+            # plt.plot(rewards_lists[top_idx[0]])
+            # plt.show()
 
 
             print(f" Iteration {i} --------------------------------")
@@ -382,12 +382,12 @@ def cem(env_fn,
         best_reward_list.append(reward_sum_after_cem)
 
         # TODO this should be a passed in progress fn
-        if i % print_freq == 0:
-            clear_output(wait=True)
-            #plt.ylim([min_y, max_y])
-            plt.ylabel('reward per episode')
-            plt.plot(best_reward_list)
-            plt.show()
+        # if i % print_freq == 0:
+        #     clear_output(wait=True)
+        #     #plt.ylim([min_y, max_y])
+        #     plt.ylabel('reward per episode')
+        #     plt.plot(best_reward_list)
+        #     plt.show()
 
 
     inference_fn = make_inference_fn(env.observation_size, env.action_size, normalize_observations, policy)
